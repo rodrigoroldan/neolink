@@ -35,11 +35,16 @@ impl Default for NeoMediaFactory {
 impl NeoMediaFactory {
     fn new() -> Self {
         let factory = Object::new::<NeoMediaFactory>();
-        factory.set_shared(false);
+        // Share a single pipeline across all RTSP clients so the pump thread
+        // and AppSrc elements survive client reconnects. Combined with
+        // SuspendMode::None the pipeline is never torn down between sessions,
+        // which prevents the "App source is closed" crash-loop when the
+        // battery camera drops and Frigate reconnects after its 20s watchdog.
+        factory.set_shared(true);
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
         // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
-        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
+        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory

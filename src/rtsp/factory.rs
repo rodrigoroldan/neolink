@@ -261,6 +261,14 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
+                            // How many consecutive frames we have skipped because
+                            // the AppSrc was temporarily unavailable (e.g. the
+                            // RTSP pipeline was being rebuilt after a client
+                            // disconnect). At 500 ms per retry this gives ~60 s
+                            // of patience before we give up and let the thread die.
+                            let mut appsrc_retry: u32 = 0;
+                            const MAX_APPSRC_RETRIES: u32 = 120;
+
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
                                     data,
@@ -271,10 +279,37 @@ pub(super) async fn make_factory(
                                     &mut aud_ts,
                                     &stream_config,
                                 );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                match r {
+                                    Ok(_) => {
+                                        appsrc_retry = 0;
+                                    }
+                                    Err(ref e)
+                                        if e.to_string().contains("App source is closed")
+                                            || e.to_string()
+                                                .contains("App source is not linked") =>
+                                    {
+                                        appsrc_retry += 1;
+                                        if appsrc_retry >= MAX_APPSRC_RETRIES {
+                                            log::warn!(
+                                                "{name}::{stream}: AppSrc unavailable for {}s, exiting pump thread",
+                                                appsrc_retry / 2
+                                            );
+                                            r?;
+                                        }
+                                        log::debug!(
+                                            "{name}::{stream}: AppSrc not ready (retry {appsrc_retry}/{MAX_APPSRC_RETRIES}), waiting..."
+                                        );
+                                        std::thread::sleep(
+                                            std::time::Duration::from_millis(500),
+                                        );
+                                    }
+                                    Err(ref e) => {
+                                        log::info!(
+                                            "{name}::{stream}: Failed to send to source: {e:?}"
+                                        );
+                                        r?;
+                                    }
                                 }
-                                r?;
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
