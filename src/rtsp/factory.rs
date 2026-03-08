@@ -154,6 +154,7 @@ pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
 ) -> AnyResult<(NeoMediaFactory, JoinHandle<AnyResult<()>>)> {
+    let reconnect_on_drop = camera.config().await?.borrow().reconnect_on_drop;
     let (client_tx, mut client_rx) = mpsc(100);
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
@@ -171,6 +172,7 @@ pub(super) async fn make_factory(
 
                         // Start the camera
                         let config = camera.config().await?.borrow().clone();
+                        let reconnect_on_drop = config.reconnect_on_drop;
                         let mut media_rx = camera.stream_while_live(stream).await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
@@ -284,9 +286,10 @@ pub(super) async fn make_factory(
                                         appsrc_retry = 0;
                                     }
                                     Err(ref e)
-                                        if e.to_string().contains("App source is closed")
-                                            || e.to_string()
-                                                .contains("App source is not linked") =>
+                                        if reconnect_on_drop
+                                            && (e.to_string().contains("App source is closed")
+                                                || e.to_string()
+                                                    .contains("App source is not linked")) =>
                                     {
                                         appsrc_retry += 1;
                                         if appsrc_retry >= MAX_APPSRC_RETRIES {
@@ -331,6 +334,7 @@ pub(super) async fn make_factory(
         Ok(Some(element))
     })
     .await?;
+    factory.set_reconnect_on_drop(reconnect_on_drop);
     Ok((factory, thread))
 }
 

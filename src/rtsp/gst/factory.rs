@@ -35,19 +35,34 @@ impl Default for NeoMediaFactory {
 impl NeoMediaFactory {
     fn new() -> Self {
         let factory = Object::new::<NeoMediaFactory>();
-        // Share a single pipeline across all RTSP clients so the pump thread
-        // and AppSrc elements survive client reconnects. Combined with
-        // SuspendMode::None the pipeline is never torn down between sessions,
-        // which prevents the "App source is closed" crash-loop when the
-        // battery camera drops and Frigate reconnects after its 20s watchdog.
-        factory.set_shared(true);
+        // Conservative upstream defaults — callers opt-in to persistent-pipeline
+        // mode via `set_reconnect_on_drop(true)`.
+        factory.set_shared(false);
         factory.set_eos_shutdown(false);
         factory.set_stop_on_disconnect(false);
-        // factory.set_publish_clock_mode(gstreamer_rtsp_server::RTSPPublishClockMode::Clock);
-        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
+        factory.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
         factory.set_launch("videotestsrc pattern=\"snow\" ! video/x-raw,width=896,height=512,framerate=25/1 ! textoverlay name=\"inittextoverlay\" text=\"Stream not Ready\" valignment=top halignment=left font-desc=\"Sans, 32\" ! jpegenc ! rtpjpegpay name=pay0");
         factory.set_transport_mode(RTSPTransportMode::PLAY);
         factory
+    }
+
+    /// Configure pipeline-persistence for cameras that reconnect frequently
+    /// (e.g. battery-powered cameras).  When `enabled` is `true`:
+    ///   - A single GStreamer pipeline is shared across all RTSP clients
+    ///     (`set_shared(true)`), so the AppSrc elements survive client
+    ///     reconnects.
+    ///   - `SuspendMode::None` prevents the pipeline from being torn down
+    ///     between sessions, which avoids the "App source is closed"
+    ///     crash-loop that occurs when the camera drops and the RTSP client
+    ///     (e.g. Frigate) reconnects after its watchdog timeout.
+    pub(crate) fn set_reconnect_on_drop(&self, enabled: bool) {
+        if enabled {
+            self.set_shared(true);
+            self.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::None);
+        } else {
+            self.set_shared(false);
+            self.set_suspend_mode(gstreamer_rtsp_server::RTSPSuspendMode::Reset);
+        }
     }
 
     pub(crate) async fn new_with_callback<F>(callback: F) -> AnyResult<Self>

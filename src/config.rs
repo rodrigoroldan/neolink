@@ -218,6 +218,13 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    /// When true (default), the GStreamer pipeline is kept alive across RTSP
+    /// client reconnects and the pump thread retries for up to 60 s when the
+    /// AppSrc is temporarily unavailable.  Set to false only if you need the
+    /// upstream default behaviour (pipeline torn down on every disconnect).
+    #[serde(default = "default_true", alias = "reconnect")]
+    pub(crate) reconnect_on_drop: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
