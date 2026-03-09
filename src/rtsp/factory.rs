@@ -263,13 +263,15 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            // How many consecutive frames we have skipped because
-                            // the AppSrc was temporarily unavailable (e.g. the
-                            // RTSP pipeline was being rebuilt after a client
-                            // disconnect). At 500 ms per retry this gives ~60 s
-                            // of patience before we give up and let the thread die.
+                            // Counter for consecutive frames skipped because the
+                            // AppSrc was temporarily unavailable.  When
+                            // reconnect_on_drop is true we retry indefinitely
+                            // (the loop exits naturally when media_rx closes,
+                            // i.e. the camera permanently disconnects).
+                            // When reconnect_on_drop is false we keep the old
+                            // 60-second bail-out so behaviour is unchanged.
                             let mut appsrc_retry: u32 = 0;
-                            const MAX_APPSRC_RETRIES: u32 = 120;
+                            const MAX_APPSRC_RETRIES: u32 = 120; // used only when reconnect_on_drop=false
 
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
@@ -283,16 +285,23 @@ pub(super) async fn make_factory(
                                 );
                                 match r {
                                     Ok(_) => {
+                                        if appsrc_retry > 0 {
+                                            log::info!(
+                                                "{name}::{stream}: AppSrc recovered after {}s",
+                                                appsrc_retry / 2
+                                            );
+                                        }
                                         appsrc_retry = 0;
                                     }
                                     Err(ref e)
-                                        if reconnect_on_drop
-                                            && (e.to_string().contains("App source is closed")
-                                                || e.to_string()
-                                                    .contains("App source is not linked")) =>
+                                        if e.to_string().contains("App source is closed")
+                                            || e.to_string()
+                                                .contains("App source is not linked") =>
                                     {
                                         appsrc_retry += 1;
-                                        if appsrc_retry >= MAX_APPSRC_RETRIES {
+                                        if !reconnect_on_drop
+                                            && appsrc_retry >= MAX_APPSRC_RETRIES
+                                        {
                                             log::warn!(
                                                 "{name}::{stream}: AppSrc unavailable for {}s, exiting pump thread",
                                                 appsrc_retry / 2
@@ -300,7 +309,7 @@ pub(super) async fn make_factory(
                                             r?;
                                         }
                                         log::debug!(
-                                            "{name}::{stream}: AppSrc not ready (retry {appsrc_retry}/{MAX_APPSRC_RETRIES}), waiting..."
+                                            "{name}::{stream}: AppSrc not ready (retry {appsrc_retry}), waiting 500ms..."
                                         );
                                         std::thread::sleep(
                                             std::time::Duration::from_millis(500),
