@@ -245,8 +245,11 @@ pub(super) async fn make_factory(
                         // Run blocking code on a seperate thread
                         // This is not an async thread
                         std::thread::spawn(move || {
-                            let mut aud_ts = 0u32;
-                            let mut vid_ts = 0u32;
+                            // Running timestamps in microseconds. These must be
+                            // 64 bit: a u32 wraps after 2^32 us (~71.6 min) and
+                            // the PTS would jump back to zero.
+                            let mut aud_ts = 0u64;
+                            let mut vid_ts = 0u64;
 
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
@@ -374,8 +377,8 @@ fn send_to_sources(
     data: BcMedia,
     vid_src: &Option<AppSrc>,
     aud_src: &Option<AppSrc>,
-    vid_ts: &mut u32,
-    aud_ts: &mut u32,
+    vid_ts: &mut u64,
+    aud_ts: &mut u64,
     stream_config: &StreamConfig,
 ) -> AnyResult<bool> {
     let mut overflowed = false;
@@ -383,31 +386,29 @@ fn send_to_sources(
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                overflowed =
-                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
+                log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts));
+                overflowed = send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts))?;
             }
-            *aud_ts += duration;
+            *aud_ts += u64::from(duration);
         }
         BcMedia::Adpcm(adpcm) => {
             let duration = adpcm
                 .duration()
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
-                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                overflowed =
-                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
+                log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts));
+                overflowed = send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts))?;
             }
-            *aud_ts += duration;
+            *aud_ts += u64::from(duration);
         }
         BcMedia::Iframe(BcMediaIframe { data, .. })
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
-                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                overflowed = send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
+                log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
+                overflowed = send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts))?;
             }
             const MICROSECONDS: u32 = 1000000;
-            *vid_ts += MICROSECONDS / stream_config.fps;
+            *vid_ts += u64::from(MICROSECONDS / stream_config.fps);
         }
         _ => {}
     }
