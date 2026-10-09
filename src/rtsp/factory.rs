@@ -70,10 +70,7 @@ impl StreamConfig {
                                 .copied()
                                 .unwrap_or(encode.default_bitrate)
                                 * 1024,
-                            framerate_table
-                                .get(encode.default_framerate as usize)
-                                .copied()
-                                .unwrap_or(encode.default_framerate),
+                            resolve_fps(encode.default_framerate, &framerate_table),
                             framerate_table.clone(),
                             bitrate_table.clone(),
                         ))
@@ -96,8 +93,12 @@ impl StreamConfig {
     }
 
     fn update_fps(&mut self, fps: u32) {
-        let new_fps = self.fps_table.get(fps as usize).copied().unwrap_or(fps);
-        self.fps = new_fps;
+        let new_fps = resolve_fps(fps, &self.fps_table);
+        // A zero frame rate is meaningless (and would be used as a divisor),
+        // keep what we had.
+        if new_fps > 0 {
+            self.fps = new_fps;
+        }
     }
     #[allow(dead_code)]
     fn update_bitrate(&mut self, bitrate: u32) {
@@ -124,6 +125,25 @@ impl StreamConfig {
                 self.vid_type = Some(*video_type);
             }
         }
+    }
+}
+
+/// Resolves a frame rate reported by the camera into frames per second.
+///
+/// Reolink cameras report the frame rate itself, both in the BcMedia info
+/// header and as `defaultFramerate` in the encode table, e.g. `20` with a
+/// table of `20,18,16,15,12,10,8,6,4,2`. Some OEM firmwares (e.g. Swann)
+/// report an index into `framerateTable` instead. Only treat the value as an
+/// index when it is not itself one of the frame rates in the table, otherwise
+/// a real frame rate such as `10` would be read as `table[10]`.
+fn resolve_fps(reported: u32, fps_table: &[u32]) -> u32 {
+    if fps_table.contains(&reported) {
+        reported
+    } else {
+        fps_table
+            .get(reported as usize)
+            .copied()
+            .unwrap_or(reported)
     }
 }
 
@@ -1067,4 +1087,35 @@ fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
 fn buffer_size(bitrate: u32) -> u32 {
     // 0.1 seconds (according to bitrate) or 4kb what ever is larger
     std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_fps;
+
+    #[test]
+    fn fps_reported_as_value() {
+        let table = [25, 22, 20, 18, 16, 15, 12, 10, 8, 6, 4, 2];
+        // Values in the table are frame rates, even if they are also a
+        // valid index into it
+        assert_eq!(resolve_fps(25, &table), 25);
+        assert_eq!(resolve_fps(15, &table), 15);
+        assert_eq!(resolve_fps(10, &table), 10);
+        assert_eq!(resolve_fps(4, &table), 4);
+        assert_eq!(resolve_fps(7, &[15, 10, 7, 4]), 7);
+    }
+
+    #[test]
+    fn fps_reported_as_index() {
+        let table = [25, 22, 20, 18, 16, 15, 12, 10, 8, 6, 4, 2];
+        assert_eq!(resolve_fps(0, &table), 25);
+        assert_eq!(resolve_fps(1, &table), 22);
+        assert_eq!(resolve_fps(3, &table), 18);
+    }
+
+    #[test]
+    fn fps_unknown() {
+        assert_eq!(resolve_fps(30, &[25, 22, 20]), 30);
+        assert_eq!(resolve_fps(15, &[]), 15);
+    }
 }
