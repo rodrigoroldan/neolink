@@ -1,9 +1,9 @@
 use gstreamer::ClockTime;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
-use gstreamer_app::{AppSrc, AppSrcCallbacks, AppStreamType};
+use gstreamer_app::{AppLeakyType, AppSrc, AppSrcCallbacks, AppStreamType};
 use neolink_core::{
     bc_protocol::StreamKind,
     bcmedia::model::{
@@ -268,8 +268,11 @@ pub(super) async fn make_factory(
                             // i.e. the camera permanently disconnects).
                             // When reconnect_on_drop is false we keep the old
                             // 60-second bail-out so behaviour is unchanged.
+                            // A closed AppSrc is permanent and ends the thread.
                             let mut appsrc_retry: u32 = 0;
                             const MAX_APPSRC_RETRIES: u32 = 120; // used only when reconnect_on_drop=false
+                            let label = format!("{name}::{stream}");
+                            let mut overflow = OverflowReport::new();
 
                             while let Some(data) = media_rx.blocking_recv() {
                                 let r = send_to_sources(
@@ -281,7 +284,7 @@ pub(super) async fn make_factory(
                                     &stream_config,
                                 );
                                 match r {
-                                    Ok(_) => {
+                                    Ok(overflowed) => {
                                         if appsrc_retry > 0 {
                                             log::info!(
                                                 "{name}::{stream}: AppSrc recovered after {}s",
@@ -289,11 +292,30 @@ pub(super) async fn make_factory(
                                             );
                                         }
                                         appsrc_retry = 0;
+                                        overflow.record(overflowed, &label, [&vid_src, &aud_src]);
                                     }
                                     Err(ref e)
-                                        if e.to_string().contains("App source is closed")
-                                            || e.to_string()
-                                                .contains("App source is not linked") =>
+                                        if matches!(
+                                            e.downcast_ref::<AppSrcUnavailable>(),
+                                            Some(AppSrcUnavailable::Closed)
+                                        ) =>
+                                    {
+                                        // The AppSrc has been removed from its bin,
+                                        // which only happens when the RTSP media that
+                                        // owned it is destroyed. It can never be fed
+                                        // again: the next client gets a new pipeline and
+                                        // a new pump thread. Stop here instead of keeping
+                                        // a second camera stream alive for nothing.
+                                        log::info!(
+                                            "{name}::{stream}: AppSrc was removed from its pipeline, stopping this pump thread"
+                                        );
+                                        break;
+                                    }
+                                    Err(ref e)
+                                        if matches!(
+                                            e.downcast_ref::<AppSrcUnavailable>(),
+                                            Some(AppSrcUnavailable::NotLinked)
+                                        ) =>
                                     {
                                         appsrc_retry += 1;
                                         if !reconnect_on_drop
@@ -344,6 +366,10 @@ pub(super) async fn make_factory(
     Ok((factory, thread))
 }
 
+/// Sends one camera frame to the matching AppSrc.
+///
+/// Returns `true` if the AppSrc queue was already full, i.e. an older queued
+/// buffer had to be discarded to make room for this one.
 fn send_to_sources(
     data: BcMedia,
     vid_src: &Option<AppSrc>,
@@ -351,13 +377,15 @@ fn send_to_sources(
     vid_ts: &mut u32,
     aud_ts: &mut u32,
     stream_config: &StreamConfig,
-) -> AnyResult<()> {
+) -> AnyResult<bool> {
+    let mut overflowed = false;
     match data {
         BcMedia::Aac(aac) => {
             let duration = aac.duration().expect("Could not calculate AAC duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::debug!("Sending AAC: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
+                overflowed =
+                    send_to_appsrc(aud_src, aac.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -367,7 +395,8 @@ fn send_to_sources(
                 .expect("Could not calculate ADPCM duration");
             if let Some(aud_src) = aud_src.as_ref() {
                 log::trace!("Sending ADPCM: {:?}", Duration::from_micros(*aud_ts as u64));
-                send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
+                overflowed =
+                    send_to_appsrc(aud_src, adpcm.data, Duration::from_micros(*aud_ts as u64))?;
             }
             *aud_ts += duration;
         }
@@ -375,17 +404,75 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts as u64));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
+                overflowed = send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts as u64))?;
             }
             const MICROSECONDS: u32 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps;
         }
         _ => {}
     }
-    Ok(())
+    Ok(overflowed)
 }
 
-fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<()> {
+/// Rate-limited report of pushes that found an AppSrc queue full.
+///
+/// The AppSrc queues are leaky (see [`make_appsrc`]): when one is full the
+/// oldest queued buffer is discarded. That keeps memory bounded, but it also
+/// means frames are being lost because data arrives faster than the pipeline
+/// consumes it (or nothing consumes it at all). Make that visible.
+struct OverflowReport {
+    overflows: u64,
+    since: Instant,
+}
+
+impl OverflowReport {
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    fn new() -> Self {
+        Self {
+            overflows: 0,
+            since: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, overflowed: bool, label: &str, sources: [&Option<AppSrc>; 2]) {
+        if overflowed {
+            self.overflows += 1;
+        }
+        if self.since.elapsed() < Self::INTERVAL {
+            return;
+        }
+        if self.overflows > 0 {
+            let state = sources
+                .iter()
+                .filter_map(|src| src.as_ref())
+                .map(|src| {
+                    format!(
+                        "{}: state={:?} level={}/{} bytes",
+                        src.name(),
+                        src.current_state(),
+                        src.current_level_bytes(),
+                        src.max_bytes()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::warn!(
+                "{label}: {} frame(s) in the last {}s found the AppSrc queue full, older buffers were discarded ({state})",
+                self.overflows,
+                self.since.elapsed().as_secs(),
+            );
+        }
+        self.overflows = 0;
+        self.since = Instant::now();
+    }
+}
+
+/// Pushes a frame into an AppSrc.
+///
+/// Returns `true` if the queue was already full, in which case the AppSrc
+/// discards its oldest queued buffer to make room for this one.
+fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult<bool> {
     check_live(appsrc)?; // Stop if appsrc is dropped
 
     // In live mode we follow the advice in
@@ -401,11 +488,11 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
                 ts = Duration::from_micros(time.useconds());
             } else {
                 // Not playing
-                return Ok(());
+                return Ok(false);
             }
         } else {
             // Clock not up yet
-            return Ok(());
+            return Ok(false);
         }
     }
     let buf = {
@@ -426,8 +513,12 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
         gst_buf
     };
 
+    // The queue is leaky: if it is already full, pushing discards the oldest
+    // queued buffer. Note it so the caller can report it.
+    let overflowed = appsrc.max_bytes() > 0 && appsrc.current_level_bytes() >= appsrc.max_bytes();
+
     // Push buffer into the appsrc
-    match appsrc.push_buffer(buf) {
+    let overflowed = match appsrc.push_buffer(buf) {
         Ok(_) => {
             // log::info!(
             //     "Send {}{} on {}",
@@ -435,15 +526,13 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
             //     if data.keyframe { " (keyframe)" } else { "" },
             //     appsrc.name()
             // );
-            Ok(())
+            Ok(overflowed)
         }
         Err(FlowError::Flushing) => {
-            // Buffer is full just skip
-            log::info!(
-                "Buffer full on {} pausing stream until client consumes frames",
-                appsrc.name()
-            );
-            Ok(())
+            // The appsrc is stopped or flushing (e.g. its media was shut
+            // down). It does not accept data in this state: skip the frame.
+            log::debug!("{} is flushing or stopped, dropping frame", appsrc.name());
+            Ok(false)
         }
         Err(e) => Err(anyhow!("Error in streaming: {e:?}")),
     }?;
@@ -457,15 +546,37 @@ fn send_to_appsrc(appsrc: &AppSrc, data: Vec<u8>, mut ts: Duration) -> AnyResult
     {
         appsrc.set_state(gstreamer::State::Paused).unwrap();
     }
-    Ok(())
+    Ok(overflowed)
 }
-fn check_live(app: &AppSrc) -> Result<()> {
-    app.bus().ok_or(anyhow!("App source is closed"))?;
+
+/// Why an AppSrc cannot currently take data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppSrcUnavailable {
+    /// The AppSrc has no bus: it was removed from its bin, which happens when
+    /// the RTSP media owning the pipeline is destroyed. This is permanent.
+    Closed,
+    /// The AppSrc src pad is not linked to the rest of its pipeline.
+    NotLinked,
+}
+
+impl std::fmt::Display for AppSrcUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppSrcUnavailable::Closed => f.write_str("App source is closed"),
+            AppSrcUnavailable::NotLinked => f.write_str("App source is not linked"),
+        }
+    }
+}
+
+impl std::error::Error for AppSrcUnavailable {}
+
+fn check_live(app: &AppSrc) -> Result<(), AppSrcUnavailable> {
+    app.bus().ok_or(AppSrcUnavailable::Closed)?;
     app.pads()
         .iter()
         .all(|pad| pad.is_linked())
         .then_some(())
-        .ok_or(anyhow!("App source is not linked"))
+        .ok_or(AppSrcUnavailable::NotLinked)
 }
 
 fn clear_bin(bin: &Element) -> Result<()> {
@@ -531,17 +642,7 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building H264 Pipeline");
-    let source = make_element("appsrc", "vidsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("vidsrc", buffer_size, stream_config)?;
 
     let source = source
         .dynamic_cast::<Element>()
@@ -583,16 +684,7 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building H265 Pipeline");
-    let source = make_element("appsrc", "vidsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("vidsrc", buffer_size, stream_config)?;
 
     let source = source
         .dynamic_cast::<Element>()
@@ -635,17 +727,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building Aac pipeline");
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("audsrc", buffer_size, stream_config)?;
 
     let source = source
         .dynamic_cast::<Element>()
@@ -722,16 +804,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     // ! audioconvert
     // ! rtpL16pay name=pay1
 
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("audsrc", buffer_size, stream_config)?;
 
     source.set_caps(Some(
         &Caps::builder("audio/x-adpcm")
@@ -793,17 +866,7 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Bin>()
         .map_err(|_| anyhow!("Media source's element should be a bin"))?;
     log::debug!("Building Silence pipeline");
-    let source = make_element("appsrc", "audsrc")?
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-
-    source.set_is_live(false);
-    source.set_block(false);
-    source.set_min_latency(1000 / (stream_config.fps as i64));
-    source.set_property("emit-signals", false);
-    source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
-    source.set_stream_type(AppStreamType::Stream);
+    let source = make_appsrc("audsrc", buffer_size, stream_config)?;
 
     let source = source
         .dynamic_cast::<Element>()
@@ -957,6 +1020,34 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot convert bin"))?;
     Ok(bin)
+}
+
+/// Creates the AppSrc that the pump thread feeds camera frames into.
+///
+/// The queue must be bounded by more than `max-bytes`: with `block=false`
+/// appsrc keeps queueing past `max-bytes` and only emits `enough-data`, which
+/// we do not listen to. Whenever the streaming thread stops draining the queue
+/// (pipeline not running, downstream blocked, sink waiting for timestamps that
+/// are ahead of the clock) every frame pushed into it is kept forever and the
+/// process grows at the stream bitrate until it is OOM-killed.
+///
+/// `leaky-type=downstream` makes `max-bytes` a real limit: when the queue is
+/// full the oldest queued buffer is discarded. `block` stays `false` so that a
+/// stalled pipeline never blocks the pump thread (and, through it, the camera
+/// connection).
+fn make_appsrc(name: &str, max_bytes: u32, stream_config: &StreamConfig) -> AnyResult<AppSrc> {
+    let source = make_element("appsrc", name)?
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
+    source.set_is_live(false);
+    source.set_block(false);
+    source.set_min_latency(1000 / (stream_config.fps as i64));
+    source.set_property("emit-signals", false);
+    source.set_max_bytes(max_bytes as u64);
+    source.set_leaky_type(AppLeakyType::Downstream);
+    source.set_do_timestamp(false);
+    source.set_stream_type(AppStreamType::Stream);
+    Ok(source)
 }
 
 fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
